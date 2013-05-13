@@ -55,6 +55,11 @@ sliceHandleKey k slice  =  (k >= keyStart slice) && (k < keyStop slice)
 
 type CacheState = MVar Cache
 
+data WaitingState = WaitingState
+    deriving (Show)
+
+type WaitingFor a = Either (Process (a)) a
+
 data SliceUpdate = Claim ProcessId Key Key
     deriving (Show, Typeable)
 
@@ -64,7 +69,6 @@ data PairRequest = Get ProcessId Key
 
 data PairReply = RGet Key (Maybe Value)
     | RSet ProcessId
-    | Forwarded ProcessId
     deriving (Show, Typeable)
 
 instance Binary PairRequest where
@@ -80,13 +84,11 @@ instance Binary PairRequest where
 instance Binary PairReply where
     put (RGet k v)    = do putWord8 1; put (k, v)
     put (RSet pid)    = do putWord8 3; put (pid)
-    put (Forwarded pid)    = do putWord8 5; put (pid)
     get = do
         header <- getWord8
         case header of
           1 -> do (k,v)     <- get; return (RGet k v)
           3 -> do (pid)     <- get; return (RSet pid)
-          5 -> do (pid)     <- get; return (Forwarded pid)
           _ -> fail "PairReply.get: invalid"
 
 instance Binary SliceUpdate where
@@ -98,47 +100,49 @@ instance Binary SliceUpdate where
           _ -> fail "SliceUpdate.get: invalid"
 
 setKey :: CacheState -> ProcessId -> Key -> Value -> Process ProcessId
-setKey state requester k val = do
+setKey c p k v = setKey' c p k v >>= either id return
+
+getKey :: CacheState -> ProcessId -> Key -> Process (Maybe Value) 
+getKey c p k = getKey' c p k >>= either id return
+
+setKey' :: CacheState -> ProcessId -> Key -> Value -> Process (WaitingFor ProcessId)
+setKey' state requester k val = do
     cache <- liftIO $ readMVar state
     let slice = L.find (sliceHandleKey k) $ slices cache
     case slice of
-        Nothing -> (liftIO $ modifyMVar state f) >> getSelfPid
+        Nothing -> (liftIO $ modifyMVar state f) >> getSelfPid >>= return . Right
                         where f st0 = do let st1 = addPair st0 k val
                                          return (st1, ())
-        Just sl -> storeKey requester k val $ process sl
+        Just sl -> (storeKey requester k val $ process sl) >>= return . Left
 
-getKey :: CacheState -> ProcessId -> Key -> Process (Maybe Value) 
-getKey state requester k = do
+getKey' :: CacheState -> ProcessId -> Key -> Process (WaitingFor  (Maybe Value)) 
+getKey' state requester k = do
     cache <- liftIO $ readMVar state
     let val = M.lookup k $ pairs cache
     case val of 
-        (Just _) -> return val
+        (Just _) -> return $ Right val
         Nothing  -> do
             let slice = L.find (sliceHandleKey k) $ slices cache
             case slice of
-                Nothing -> return Nothing
-                Just sl -> retrieveKey requester k $ process sl
+                Nothing -> return $ Right Nothing
+                Just sl -> (retrieveKey requester k $ process sl) >>= return . Left
 
-storeKey :: ProcessId -> Key -> Value -> ProcessId -> Process ProcessId
+storeKey :: ProcessId -> Key -> Value -> ProcessId -> Process (Process ProcessId)
 storeKey requester k val pid = do
-    send requester $ Forwarded requester
     send pid $ Set requester k val
-    go
+    return go
     where go = do msg <- expect
                   case msg of
                         RSet keyPid     -> return keyPid
-                        Forwarded pid   -> go
                         _               -> fail "expecting a RSet" 
 
-retrieveKey :: ProcessId -> Key -> ProcessId -> Process (Maybe Value)
+retrieveKey :: ProcessId -> Key -> ProcessId -> Process (Process (Maybe Value))
 retrieveKey requester k pid = do
-    send requester $ Forwarded requester
     send pid $ Get requester k
-    go
+    return go
     where go = do msg <- expect
                   case msg of
                         RGet k val      -> return val
-                        Forwarded pid   -> go
                         _               -> fail "expecting a RGet"
 
 pairsManager :: CacheState -> Process ()
@@ -146,12 +150,16 @@ pairsManager state = do
     forever $ do
         msg <- expect
         case msg of
+            -- if we don't have an immediate result, ignore, it has been forwarded
             Get requester k -> do
-                val <- getKey state requester k
-                send requester $ RGet k val
+                getKey' state requester k >>= either ignore reply
+                where reply    = send requester . RGet k
+                      ignore _ = return ()
+
             Set requester k val -> do
-                pid <- setKey state requester k val
-                send requester $ RSet pid
+                setKey' state requester k val >>= either ignore reply
+                where reply    = send requester . RSet
+                      ignore _ = return ()
 
 sliceManager :: CacheState -> Process ()
 sliceManager state = do
