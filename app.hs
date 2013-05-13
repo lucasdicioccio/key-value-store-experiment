@@ -5,6 +5,7 @@
 module Main where
 
 import System.Environment (getArgs)
+import Control.Exception as E
 import Control.Distributed.Process
 import Control.Distributed.Process.Internal.Types (LocalNode)
 import Control.Distributed.Process.Closure
@@ -13,15 +14,20 @@ import Control.Distributed.Process.Backend.SimpleLocalnet
 import Control.Concurrent.MVar
 import Control.Concurrent (threadDelay)
 import Control.Monad
-import qualified Data.Map as M
+-- import qualified Data.Map as M
+import qualified Data.IntMap as M
 import qualified Data.List as L
+import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as C
+import Data.List.Split
 import Data.Typeable (Typeable)
 import Data.Binary (Binary (get,put),putWord8,getWord8)
 import Data.Maybe
 
 type Key    = Int
-type Value  = String
+type Value  = B.ByteString
 type ProcessName = ProcessId
+type KeyValueStore = M.IntMap Value
 
 data Slice = Slice 
     { process   :: ProcessName
@@ -30,7 +36,7 @@ data Slice = Slice
     } deriving (Show,Eq)
 
 data Cache = Cache 
-    { pairs    :: M.Map Key Value
+    { pairs    :: KeyValueStore
     , slices   :: [Slice]
     } deriving (Show)
 
@@ -40,7 +46,6 @@ addSlice c s = c { slices = L.union [s] (slices c) }
 removeAllSlicesForPid :: Cache -> ProcessName -> Cache
 removeAllSlicesForPid c pid = c { slices = L.filter f (slices c) }
         where f slice = process slice /= pid
-
 
 addPair :: Cache -> Key -> Value -> Cache
 addPair c k v = c { pairs = M.insert k v (pairs c) }
@@ -59,6 +64,7 @@ data PairRequest = Get ProcessId Key
 
 data PairReply = RGet Key (Maybe Value)
     | RSet ProcessId
+    | Forwarded ProcessId
     deriving (Show, Typeable)
 
 instance Binary PairRequest where
@@ -74,11 +80,13 @@ instance Binary PairRequest where
 instance Binary PairReply where
     put (RGet k v)    = do putWord8 1; put (k, v)
     put (RSet pid)    = do putWord8 3; put (pid)
+    put (Forwarded pid)    = do putWord8 5; put (pid)
     get = do
         header <- getWord8
         case header of
           1 -> do (k,v)     <- get; return (RGet k v)
           3 -> do (pid)     <- get; return (RSet pid)
+          5 -> do (pid)     <- get; return (Forwarded pid)
           _ -> fail "PairReply.get: invalid"
 
 instance Binary SliceUpdate where
@@ -89,18 +97,18 @@ instance Binary SliceUpdate where
           0 -> do (p,k1,k2)   <- get; return (Claim p k1 k2)
           _ -> fail "SliceUpdate.get: invalid"
 
-setKey :: CacheState -> Key -> Value -> Process ProcessId
-setKey state k val = do
+setKey :: CacheState -> ProcessId -> Key -> Value -> Process ProcessId
+setKey state requester k val = do
     cache <- liftIO $ readMVar state
     let slice = L.find (sliceHandleKey k) $ slices cache
     case slice of
         Nothing -> (liftIO $ modifyMVar state f) >> getSelfPid
                         where f st0 = do let st1 = addPair st0 k val
                                          return (st1, ())
-        Just sl -> storeKey k val $ process sl
+        Just sl -> storeKey requester k val $ process sl
 
-getKey :: CacheState -> Key -> Process (Maybe Value) 
-getKey state k = do
+getKey :: CacheState -> ProcessId -> Key -> Process (Maybe Value) 
+getKey state requester k = do
     cache <- liftIO $ readMVar state
     let val = M.lookup k $ pairs cache
     case val of 
@@ -109,37 +117,41 @@ getKey state k = do
             let slice = L.find (sliceHandleKey k) $ slices cache
             case slice of
                 Nothing -> return Nothing
-                Just sl -> retrieveKey k $ process sl
+                Just sl -> retrieveKey requester k $ process sl
 
-storeKey :: Key -> Value -> ProcessId -> Process ProcessId
-storeKey k val pid = do
-    me <- getSelfPid
-    send pid $ Set me k val
-    msg <- expect -- XXX ordering may be wrong
-    case msg of
-        RSet keyPid -> return keyPid
-        _          -> fail "expecting a RSet" 
+storeKey :: ProcessId -> Key -> Value -> ProcessId -> Process ProcessId
+storeKey requester k val pid = do
+    send requester $ Forwarded requester
+    send pid $ Set requester k val
+    go
+    where go = do msg <- expect
+                  case msg of
+                        RSet keyPid     -> return keyPid
+                        Forwarded pid   -> go
+                        _               -> fail "expecting a RSet" 
 
-retrieveKey :: Key -> ProcessId -> Process (Maybe Value)
-retrieveKey k pid = do
-    me <- getSelfPid
-    send pid $ Get me k
-    msg <- expect -- XXX ordering may be wrong
-    case msg of
-        RGet k val -> return val
-        _          -> fail "expecting a RGet"
+retrieveKey :: ProcessId -> Key -> ProcessId -> Process (Maybe Value)
+retrieveKey requester k pid = do
+    send requester $ Forwarded requester
+    send pid $ Get requester k
+    go
+    where go = do msg <- expect
+                  case msg of
+                        RGet k val      -> return val
+                        Forwarded pid   -> go
+                        _               -> fail "expecting a RGet"
 
 pairsManager :: CacheState -> Process ()
 pairsManager state = do
     forever $ do
         msg <- expect
         case msg of
-            Get caller k -> do
-                val <- getKey state k
-                send caller $ RGet k val
-            Set caller k val -> do
-                pid <- setKey state k val
-                send caller $ RSet pid
+            Get requester k -> do
+                val <- getKey state requester k
+                send requester $ RGet k val
+            Set requester k val -> do
+                pid <- setKey state requester k val
+                send requester $ RSet pid
 
 sliceManager :: CacheState -> Process ()
 sliceManager state = do
@@ -176,21 +188,34 @@ runPort port k0 k1 = do
     cache <- liftIO $ newMVar $ Cache M.empty []
     backend <- initializeBackend "localhost" port remotables
     me <- newLocalNode backend
-    runProcess me $ do
-        spawnLocal $ sliceManager cache
-        pairsMan  <- spawnLocal $ pairsManager cache
-        liftIO $ forkProcess me $ claimSliceToOtherNodes (Slice pairsMan k0 k1) backend
 
-        liftIO $ threadDelay 5000000 -- XXX this is an horrible hack to allow piping into stding after an amount of time reasonable enough
-        forever $ do 
-            str <- liftIO $ getLine
-            case (break (== ' ') str) of
-                ("keys","")  -> liftIO $ readMVar cache >>= print . M.keys . pairs
-                ("cache","") -> liftIO $ readMVar cache >>= print
-                ("get",k)    -> getKey cache (read $ tail k) >>= liftIO . print
-                ("set",kv)   -> do let (k,v) = break (== ' ') (tail kv)
-                                   setKey cache (read k) (tail v) >>= liftIO . print
-                _          -> liftIO $ print "not understood"
+    -- starts all the processes
+    pairsMan <- forkProcess me $ pairsManager cache
+    forkProcess me $ claimSliceToOtherNodes (Slice pairsMan k0 k1) backend
+    forkProcess me $ sliceManager cache
+
+     -- XXX this is an horrible hack to allow piping in stdin after some of time
+    threadDelay 3000000 
+
+    E.catch (forever $ getLine >>= handleString me cache)
+            ignore
+            where ignore :: IOException -> IO ()
+                  ignore _ = return ()
+
+
+handleString :: LocalNode -> CacheState -> String -> IO ()
+handleString me c str = runProcess me $ handleString' c str
+
+handleString' :: CacheState -> String -> Process ()
+handleString' cache str = do
+    this <- getSelfPid
+    ret <- case (splitOn " " str) of
+           ["keys"]     -> (liftIO $ readMVar cache)    >>= return . show . M.keys . pairs
+           ["cache"]    -> (liftIO $ readMVar cache)    >>= return . show
+           ["get",k]    -> getKey cache this (read k)   >>= return . show
+           ["set",k,v]  -> setKey cache this (read k) (C.pack v) >>= return . show
+           _          -> return "not understood"
+    liftIO $ putStrLn ret
 
 claimSliceToOtherNodes :: Slice -> Backend -> Process ()
 claimSliceToOtherNodes (Slice pid k0 k1) backend = do
