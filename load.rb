@@ -9,6 +9,7 @@ def get_key k
 end
 
 args        = ARGV.dup
+ExitWait    = args.delete('--exit-wait')
 MaxKey      = args.shift.to_i
 Iterations  = args.shift.to_i
 
@@ -25,4 +26,4 @@ File.open('/dev/urandom') do |f|
   end
 end
 
-STDIN.gets
+STDIN.gets if ExitWait
