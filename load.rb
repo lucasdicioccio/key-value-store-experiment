@@ -12,12 +12,13 @@ args        = ARGV.dup
 ExitWait    = args.delete('--exit-wait')
 MaxKey      = args.shift.to_i
 Iterations  = args.shift.to_i
+SetRatio    = args.shift.to_f
 
 
 File.open('/dev/urandom') do |f|
   Iterations.times do |t|
     k = rand MaxKey
-    if rand() < 0.5
+    if rand() < SetRatio
       val = f.read(16).unpack('H2'*16)
       set_key k, val
     else
