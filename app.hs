@@ -58,7 +58,7 @@ type CacheState = MVar Cache
 data WaitingState = WaitingState
     deriving (Show)
 
-type WaitingFor a = Either (Process (a)) a
+type WaitingFor a = Either () a
 
 data SliceUpdate = Claim ProcessId Key Key
     deriving (Show, Typeable)
@@ -99,11 +99,23 @@ instance Binary SliceUpdate where
           0 -> do (p,k1,k2)   <- get; return (Claim p k1 k2)
           _ -> fail "SliceUpdate.get: invalid"
 
-setKey :: CacheState -> ProcessId -> Key -> Value -> Process ProcessId
-setKey c p k v = setKey' c p k v >>= either id return
+setKey :: ProcessId -> Key -> Value -> Process ProcessId
+setKey me k v = do
+    nsend "pairs.server" $ Set me k v
+    go
+    where go = do msg <- expect
+                  case msg of
+                        RSet keyPid     -> return keyPid
+                        _               -> fail "expecting a RSet" 
 
-getKey :: CacheState -> ProcessId -> Key -> Process (Maybe Value) 
-getKey c p k = getKey' c p k >>= either id return
+getKey :: ProcessId -> Key -> Process (Maybe Value) 
+getKey me k = do 
+    nsend "pairs.server" $ Get me k
+    go
+    where go = do msg <- expect
+                  case msg of
+                        RGet k val      -> return val
+                        _               -> fail "expecting a RGet"
 
 setKey' :: CacheState -> ProcessId -> Key -> Value -> Process (WaitingFor ProcessId)
 setKey' state requester k val = do
@@ -127,26 +139,15 @@ getKey' state requester k = do
                 Nothing -> return $ Right Nothing
                 Just sl -> (retrieveKey requester k $ process sl) >>= return . Left
 
-storeKey :: ProcessId -> Key -> Value -> ProcessId -> Process (Process ProcessId)
-storeKey requester k val pid = do
-    send pid $ Set requester k val
-    return go
-    where go = do msg <- expect
-                  case msg of
-                        RSet keyPid     -> return keyPid
-                        _               -> fail "expecting a RSet" 
+storeKey :: ProcessId -> Key -> Value -> ProcessId -> Process ()
+storeKey requester k val pid = send pid $ Set requester k val
 
-retrieveKey :: ProcessId -> Key -> ProcessId -> Process (Process (Maybe Value))
-retrieveKey requester k pid = do
-    send pid $ Get requester k
-    return go
-    where go = do msg <- expect
-                  case msg of
-                        RGet k val      -> return val
-                        _               -> fail "expecting a RGet"
+retrieveKey :: ProcessId -> Key -> ProcessId -> Process ()
+retrieveKey requester k pid = send pid $ Get requester k
 
 pairsManager :: CacheState -> Process ()
 pairsManager state = do
+    getSelfPid >>= register "pairs.server"
     forever $ do
         msg <- expect
         case msg of
@@ -212,7 +213,7 @@ runPort port k0 k1 = do
 
 
 handleString :: LocalNode -> CacheState -> String -> IO ()
-handleString me c str = runProcess me $ handleString' c str
+handleString me c str = (forkProcess me $ handleString' c str) >> return ()
 
 handleString' :: CacheState -> String -> Process ()
 handleString' cache str = do
@@ -220,8 +221,8 @@ handleString' cache str = do
     ret <- case (splitOn " " str) of
            ["keys"]     -> (liftIO $ readMVar cache)    >>= return . show . M.keys . pairs
            ["cache"]    -> (liftIO $ readMVar cache)    >>= return . show
-           ["get",k]    -> getKey cache this (read k)   >>= return . show
-           ["set",k,v]  -> setKey cache this (read k) (C.pack v) >>= return . show
+           ["get",k]    -> getKey this (read k)   >>= return . show
+           ["set",k,v]  -> setKey this (read k) (C.pack v) >>= return . show
            _          -> return "not understood"
     liftIO $ putStrLn ret
 
