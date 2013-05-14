@@ -192,16 +192,23 @@ forwardSliceUpdate msg n = spawn n ($(mkClosure 'sliceMessage) (msg)) >> return 
 
 runPort :: String -> [(Key,Key)] -> IO ()
 runPort port ks = do
-    tc <- atomically $ newTChan :: IO (TChan B.ByteString)
+    --backend
     b <- initializeBackend "localhost" port remotables 
+    
+    -- localnodes storing data slices
     localNodes <- mapM (\_ -> newLocalNode b) ks
     mapM_ (\(kPair,n) -> forkIO (runBackend kPair n b)) (zip ks localNodes)
+
+    -- channel to receive command to be parsed
+    tc <- atomically $ newTChan :: IO (TChan B.ByteString)
+
+    -- localnode doing the parsing is the node for the first slice
+    let me = localNodes !! 0
+    forkProcess me $ forever $ handleString =<< (liftIO $ atomically $ readTChan tc)
+
      -- XXX this is an horrible hack to allow piping in stdin after some of time
     threadDelay 3000000 
     print "reading stdin"
-    
-    forkIO . forever $ atomically (readTChan tc) >>= handleString (head localNodes)
-
     E.catch (forever (B.getLine >>= \bs -> atomically (writeTChan tc bs))) ignore
     print "done"
             where ignore :: IOException -> IO ()
@@ -217,11 +224,8 @@ runBackend (k0,k1) me backend = do
     return ()
 
 
-handleString :: LocalNode -> B.ByteString -> IO ()
-handleString me str = ({-# SCC "forkprocesshandle" #-} forkProcess me $ handleString' str) >> return ()
-
-handleString' :: B.ByteString -> Process ()
-handleString' str = {-# SCC "handleString'" #-} do 
+handleString :: B.ByteString -> Process ()
+handleString str = {-# SCC "handleString" #-} do 
     this <- getSelfPid
     ret <- case ({-# SCC "splitOn" #-} C.split ' ' str) of
            ["get",k]    -> getKey this (read' k)   >>= return . show
