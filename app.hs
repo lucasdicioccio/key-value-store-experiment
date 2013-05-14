@@ -11,8 +11,9 @@ import Control.Distributed.Process.Internal.Types (LocalNode)
 import Control.Distributed.Process.Closure
 import Control.Distributed.Process.Node (runProcess,forkProcess,initRemoteTable)
 import Control.Distributed.Process.Backend.SimpleLocalnet
-import Control.Concurrent.MVar
-import Control.Concurrent (threadDelay)
+import Control.Concurrent
+import Control.Concurrent.STM
+import Control.Concurrent (threadDelay,forkIO)
 import Control.Monad
 -- import qualified Data.Map as M
 import qualified Data.IntMap as M
@@ -53,7 +54,7 @@ addPair c k v = c { pairs = M.insert k v (pairs c) }
 sliceHandleKey :: Key -> Slice -> Bool
 sliceHandleKey k slice  =  (k >= keyStart slice) && (k < keyStop slice)
 
-type CacheState = MVar Cache
+type CacheState = TVar Cache
 
 data WaitingState = WaitingState
     deriving (Show)
@@ -119,17 +120,16 @@ getKey me k = do
 
 setKey' :: CacheState -> ProcessId -> Key -> Value -> Process (WaitingFor ProcessId)
 setKey' state requester k val = do
-    cache <- liftIO $ readMVar state
+    cache <- liftIO $ atomically $ readTVar state
     let slice = L.find (sliceHandleKey k) $ slices cache
     case slice of
-        Nothing -> (liftIO $ modifyMVar state f) >> getSelfPid >>= return . Right
-                        where f st0 = do let st1 = addPair st0 k val
-                                         return (st1, ())
+        Nothing -> (liftIO $ atomically $ modifyTVar state f) >> getSelfPid >>= return . Right
+                        where f st0 = addPair st0 k val
         Just sl -> (storeKey requester k val $ process sl) >>= return . Left
 
 getKey' :: CacheState -> ProcessId -> Key -> Process (WaitingFor  (Maybe Value)) 
 getKey' state requester k = do
-    cache <- liftIO $ readMVar state
+    cache <- liftIO $ atomically $ readTVar state
     let val = M.lookup k $ pairs cache
     case val of 
         (Just _) -> return $ Right val
@@ -171,16 +171,14 @@ sliceManager state = do
 
 remoteSliceDied :: CacheState -> ProcessMonitorNotification -> Process ()
 remoteSliceDied state (ProcessMonitorNotification _ pid reason) = do
-    liftIO $ modifyMVar state f 
-            where f st0 = do let st1 = removeAllSlicesForPid st0 pid
-                             return (st1, ())
+    liftIO $ atomically $ modifyTVar state f 
+            where f st0 = removeAllSlicesForPid st0 pid
 
 sliceClaimed :: CacheState -> SliceUpdate -> Process ()
 sliceClaimed state (Claim pid k0 k1) = do
     monitor pid -- XXX this will setup multiple monitors for same process
-    liftIO $ modifyMVar state f 
-            where f st0 = do let st1 = addSlice st0 $ Slice pid k0 k1
-                             return (st1, ())
+    liftIO $ atomically $ modifyTVar state f 
+            where f st0 = addSlice st0 $ Slice pid k0 k1
 
 
 sliceMessage :: SliceUpdate -> Process ()
@@ -192,35 +190,36 @@ remotables = __remoteTable $ initRemoteTable
 forwardSliceUpdate :: SliceUpdate -> NodeId -> Process ()
 forwardSliceUpdate msg n = spawn n ($(mkClosure 'sliceMessage) (msg)) >> return ()
 
-runPort :: String -> Key -> Key -> IO ()
-runPort port k0 k1 = do 
-    cache <- liftIO $ newMVar $ Cache M.empty []
-    backend <- initializeBackend "localhost" port remotables
-    me <- newLocalNode backend
-
-    -- starts all the processes
-    pairsMan <- forkProcess me $ pairsManager cache
-    forkProcess me $ claimSliceToOtherNodes (Slice pairsMan k0 k1) backend
-    forkProcess me $ sliceManager cache
-
+runPort :: String -> [(Key,Key)] -> IO ()
+runPort port ks = do
+    b <- initializeBackend "localhost" port remotables 
+    localNodes <- mapM (\_ -> newLocalNode b) ks
+    mapM_ (\(kPair,n) -> forkIO (runBackend kPair n b)) (zip ks localNodes)
      -- XXX this is an horrible hack to allow piping in stdin after some of time
     threadDelay 3000000 
-
-    E.catch (forever $ getLine >>= handleString me cache)
-            ignore
+    print "reading stdin"
+    E.catch (forever $ getLine >>= handleString (head localNodes)) ignore
+    print "done"
             where ignore :: IOException -> IO ()
                   ignore _ = return ()
 
 
-handleString :: LocalNode -> CacheState -> String -> IO ()
-handleString me c str = (forkProcess me $ handleString' c str) >> return ()
+runBackend :: (Key,Key) -> LocalNode -> Backend -> IO ()
+runBackend (k0,k1) me backend = do
+    cache <- atomically $ newTVar $ Cache M.empty []
+    pairsMan <- forkProcess me $ pairsManager cache
+    forkProcess me $ claimSliceToOtherNodes (Slice pairsMan k0 k1) backend
+    forkProcess me $ sliceManager cache
+    return ()
 
-handleString' :: CacheState -> String -> Process ()
-handleString' cache str = do
+
+handleString :: LocalNode -> String -> IO ()
+handleString me str = (forkProcess me $ handleString' str) >> return ()
+
+handleString' :: String -> Process ()
+handleString' str = do
     this <- getSelfPid
     ret <- case (splitOn " " str) of
-           ["keys"]     -> (liftIO $ readMVar cache)    >>= return . show . M.keys . pairs
-           ["cache"]    -> (liftIO $ readMVar cache)    >>= return . show
            ["get",k]    -> getKey this (read k)   >>= return . show
            ["set",k,v]  -> setKey this (read k) (C.pack v) >>= return . show
            _          -> return "not understood"
@@ -237,7 +236,9 @@ main :: IO ()
 main = do
     args <- getArgs
     case args of
-        [port] -> runPort port 0 65535
-        [port,sk0,sk1] -> runPort port k0 k1
-                    where (k0,k1) = (minimum ks, maximum ks)
-                                    where ks = map read [sk0,sk1]
+        port:[] -> runPort port [(0,65535)]
+        port:skps -> runPort port pairs
+                    where pairs = map toKeyPair skps
+                                    where toKeyPair :: String -> (Key,Key)
+                                          toKeyPair s = head $ zip ks (tail ks)
+                                                          where ks = map read $ splitOn "," s
