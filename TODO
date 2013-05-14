@@ -1,0 +1,3 @@
+* use finer Locking on the cache state
+* experiment with using STM to access the cache
+* add limited job queue (e.g., via monitored processes?)
