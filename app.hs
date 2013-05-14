@@ -2,7 +2,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TemplateHaskell #-}
 
-module Main where
+module Main ( main ) where
 
 import System.Environment (getArgs)
 import Control.Exception as E
@@ -102,34 +102,34 @@ instance Binary SliceUpdate where
 
 setKey :: ProcessId -> Key -> Value -> Process ProcessId
 setKey me k v = do
-    nsend "pairs.server" $ Set me k v
+    {-# SCC "setsend" #-}nsend "pairs.server" $ Set me k v
     go
-    where go = do msg <- expect
+    where go = do msg <- {-# SCC "setexpect" #-}expect
                   case msg of
                         RSet keyPid     -> return keyPid
                         _               -> fail "expecting a RSet" 
 
 getKey :: ProcessId -> Key -> Process (Maybe Value) 
 getKey me k = do 
-    nsend "pairs.server" $ Get me k
+    {-# SCC "getsend" #-} nsend "pairs.server" $ Get me k
     go
-    where go = do msg <- expect
+    where go = do msg <- {-# SCC "getexpect" #-}expect
                   case msg of
                         RGet k val      -> return val
                         _               -> fail "expecting a RGet"
 
 setKey' :: CacheState -> ProcessId -> Key -> Value -> Process (WaitingFor ProcessId)
 setKey' state requester k val = do
-    cache <- liftIO $ atomically $ readTVar state
+    cache <- {-# SCC "tvarset" #-} liftIO $ atomically $ readTVar state
     let slice = L.find (sliceHandleKey k) $ slices cache
     case slice of
-        Nothing -> (liftIO $ atomically $ modifyTVar state f) >> getSelfPid >>= return . Right
+        Nothing -> ({-# SCC "tvarmodify" #-} liftIO $ atomically $ modifyTVar state f) >> getSelfPid >>= return . Right
                         where f st0 = addPair st0 k val
         Just sl -> (storeKey requester k val $ process sl) >>= return . Left
 
 getKey' :: CacheState -> ProcessId -> Key -> Process (WaitingFor  (Maybe Value)) 
 getKey' state requester k = do
-    cache <- liftIO $ atomically $ readTVar state
+    cache <- {-# SCC "tvarget" #-}liftIO $ atomically $ readTVar state
     let val = M.lookup k $ pairs cache
     case val of 
         (Just _) -> return $ Right val
@@ -192,13 +192,17 @@ forwardSliceUpdate msg n = spawn n ($(mkClosure 'sliceMessage) (msg)) >> return 
 
 runPort :: String -> [(Key,Key)] -> IO ()
 runPort port ks = do
+    tc <- atomically $ newTChan :: IO (TChan B.ByteString)
     b <- initializeBackend "localhost" port remotables 
     localNodes <- mapM (\_ -> newLocalNode b) ks
     mapM_ (\(kPair,n) -> forkIO (runBackend kPair n b)) (zip ks localNodes)
      -- XXX this is an horrible hack to allow piping in stdin after some of time
     threadDelay 3000000 
     print "reading stdin"
-    E.catch (forever $ getLine >>= handleString (head localNodes)) ignore
+    
+    forkIO . forever $ atomically (readTChan tc) >>= handleString (head localNodes)
+
+    E.catch (forever (B.getLine >>= \bs -> atomically (writeTChan tc bs))) ignore
     print "done"
             where ignore :: IOException -> IO ()
                   ignore _ = return ()
@@ -213,21 +217,22 @@ runBackend (k0,k1) me backend = do
     return ()
 
 
-handleString :: LocalNode -> String -> IO ()
-handleString me str = (forkProcess me $ handleString' str) >> return ()
+handleString :: LocalNode -> B.ByteString -> IO ()
+handleString me str = ({-# SCC "forkprocesshandle" #-} forkProcess me $ handleString' str) >> return ()
 
-handleString' :: String -> Process ()
-handleString' str = do
+handleString' :: B.ByteString -> Process ()
+handleString' str = {-# SCC "handleString'" #-} do 
     this <- getSelfPid
-    ret <- case (splitOn " " str) of
-           ["get",k]    -> getKey this (read k)   >>= return . show
-           ["set",k,v]  -> setKey this (read k) (C.pack v) >>= return . show
+    ret <- case ({-# SCC "splitOn" #-} C.split ' ' str) of
+           ["get",k]    -> getKey this (read' k)   >>= return . show
+           ["set",k,v]  -> setKey this (read' k) v >>= return . show
            _          -> return "not understood"
     liftIO $ putStrLn ret
+    where read' = fst . fromJust . C.readInt
 
 claimSliceToOtherNodes :: Slice -> Backend -> Process ()
 claimSliceToOtherNodes (Slice pid k0 k1) backend = do
-    forever $ do
+    forever $ {-# SCC "claimpeers" #-} do
         nodes <- liftIO $ findPeers backend 2000000
         me <- getSelfNode
         forM_ (filter (/= me) nodes) (forwardSliceUpdate (Claim pid k0 k1))
