@@ -32,9 +32,9 @@ Then you can write commands to it:
 To run with synthetic load, use:
 
 	#in a terminal
-	ruby load.rb 1000 500000 0.5 | ./app 9990 0 500
+	ruby load.rb 1000 500000 0.5 | ./app 9990 0,500
 	#in another terminal
-	ruby load.rb 1000 500000 0.5 | ./app 9991 500 1000
+	ruby load.rb 1000 500000 0.5 | ./app 9991 500,1000
 
 Each of this two commands will start a local cache on port 9990 (resp. 9991).
 The cache will be responsible for keys from 0 to 499 (resp. 500 to 999)
