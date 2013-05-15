@@ -72,6 +72,11 @@ data PairReply = RGet Key (Maybe Value)
     | RSet ProcessId
     deriving (Show, Typeable)
 
+data MonitorMessage = Ping ProcessId
+    | Pong ProcessId
+    | Dump
+    deriving (Show, Typeable)
+
 instance Binary PairRequest where
     put (Get pid k)   = do putWord8 0; put (pid,k)
     put (Set pid k v) = do putWord8 2; put (pid, k, v)
@@ -99,6 +104,18 @@ instance Binary SliceUpdate where
         case header of
           0 -> do (p,k1,k2)   <- get; return (Claim p k1 k2)
           _ -> fail "SliceUpdate.get: invalid"
+
+instance Binary MonitorMessage where
+    put (Ping pid)    = do putWord8 1; put (pid)
+    put (Pong pid)    = do putWord8 2; put (pid)
+    put (Dump)        = do putWord8 3
+    get = do
+        header <- getWord8
+        case header of
+          1 -> do (pid)     <- get; return (Ping pid)
+          2 -> do (pid)     <- get; return (Pong pid)
+          3 -> return Dump
+          _ -> fail "MonitorMessage.get: invalid"
 
 setKey :: ProcessId -> Key -> Value -> Process ProcessId
 setKey me k v = do
@@ -165,9 +182,20 @@ pairsManager state = do
 sliceManager :: CacheState -> Process ()
 sliceManager state = do
     getSelfPid >>= register "slice.server"
+    liftIO $ print "slice registered"
     forever $ receiveWait   [ match (remoteSliceDied state) , 
                               match (sliceClaimed state)
                             ]
+monitoringManager :: CacheState -> Process ()
+monitoringManager state = do
+    getSelfPid >>= register "monitor.server"
+    liftIO $ print "monitor registered"
+    me <- getSelfPid
+    forever $ do
+        msg <- expect
+        case msg of
+            Ping from -> send from $ Pong me
+            Dump      -> liftIO $ (atomically $ readTVar state) >>= print
 
 remoteSliceDied :: CacheState -> ProcessMonitorNotification -> Process ()
 remoteSliceDied state (ProcessMonitorNotification _ pid reason) = do
@@ -181,10 +209,13 @@ sliceClaimed state (Claim pid k0 k1) = do
             where f st0 = addSlice st0 $ Slice pid k0 k1
 
 
+monitorMessage :: MonitorMessage -> Process ()
+monitorMessage = nsend "monitor.server"
+
 sliceMessage :: SliceUpdate -> Process ()
 sliceMessage = nsend "slice.server"
 
-remotable ['sliceMessage]
+remotable ['sliceMessage,'monitorMessage]
 remotables = __remoteTable $ initRemoteTable
 
 forwardSliceUpdate :: SliceUpdate -> NodeId -> Process ()
@@ -192,6 +223,7 @@ forwardSliceUpdate msg n = spawn n ($(mkClosure 'sliceMessage) (msg)) >> return 
 
 runPort :: String -> [(Key,Key)] -> IO ()
 runPort port ks = do
+    print ks 
     --backend
     b <- initializeBackend "localhost" port remotables 
     
@@ -221,6 +253,7 @@ runBackend (k0,k1) me backend = do
     pairsMan <- forkProcess me $ pairsManager cache
     forkProcess me $ claimSliceToOtherNodes (Slice pairsMan k0 k1) backend
     forkProcess me $ sliceManager cache
+    forkProcess me $ monitoringManager cache
     return ()
 
 
@@ -228,16 +261,17 @@ handleString :: B.ByteString -> Process ()
 handleString str = {-# SCC "handleString" #-} do 
     this <- getSelfPid
     ret <- case ({-# SCC "splitOn" #-} C.split ' ' str) of
-           ["get",k]    -> getKey this (read' k)   >>= return . show
-           ["set",k,v]  -> setKey this (read' k) v >>= return . show
-           _          -> return "not understood"
-    liftIO $ putStrLn ret
+           ["dump"]     -> monitorMessage Dump     >>  return Nothing
+           ["get",k]    -> getKey this (read' k)   >>= return . Just . show
+           ["set",k,v]  -> setKey this (read' k) v >>= return . Just .show
+           _            -> return $ Just "not understood"
+    liftIO $ maybe (return ()) putStrLn ret
     where read' = fst . fromJust . C.readInt
 
 claimSliceToOtherNodes :: Slice -> Backend -> Process ()
 claimSliceToOtherNodes (Slice pid k0 k1) backend = do
     forever $ {-# SCC "claimpeers" #-} do
-        nodes <- liftIO $ findPeers backend 2000000
+        nodes <- liftIO $ findPeers backend 500000
         me <- getSelfNode
         forM_ (filter (/= me) nodes) (forwardSliceUpdate (Claim pid k0 k1))
 
