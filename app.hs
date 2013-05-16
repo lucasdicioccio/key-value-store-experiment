@@ -13,7 +13,6 @@ import Control.Distributed.Process.Node (runProcess,forkProcess,initRemoteTable)
 import Control.Distributed.Process.Backend.SimpleLocalnet
 import Control.Concurrent
 import Control.Concurrent.STM
-import Control.Concurrent (threadDelay,forkIO)
 import Control.Monad
 -- import qualified Data.Map as M
 import qualified Data.IntMap as M
@@ -42,7 +41,7 @@ data Cache = Cache
     } deriving (Show)
 
 addSlice :: Cache -> Slice -> Cache
-addSlice c s = c { slices = L.union [s] (slices c) }
+addSlice c s = c { slices = [s] `L.union` slices c }
 
 removeAllSlicesForPid :: Cache -> ProcessName -> Cache
 removeAllSlicesForPid c pid = c { slices = L.filter f (slices c) }
@@ -89,7 +88,7 @@ instance Binary PairRequest where
 
 instance Binary PairReply where
     put (RGet k v)    = do putWord8 1; put (k, v)
-    put (RSet pid)    = do putWord8 3; put (pid)
+    put (RSet pid)    = do putWord8 3; put pid
     get = do
         header <- getWord8
         case header of
@@ -106,9 +105,9 @@ instance Binary SliceUpdate where
           _ -> fail "SliceUpdate.get: invalid"
 
 instance Binary MonitorMessage where
-    put (Ping pid)    = do putWord8 1; put (pid)
-    put (Pong pid)    = do putWord8 2; put (pid)
-    put (Dump)        = do putWord8 3
+    put (Ping pid)    = do putWord8 1; put pid
+    put (Pong pid)    = do putWord8 2; put pid
+    put Dump          = putWord8 3
     get = do
         header <- getWord8
         case header of
@@ -140,9 +139,9 @@ setKey' state requester k val = do
     cache <- {-# SCC "tvarset" #-} liftIO $ atomically $ readTVar state
     let slice = L.find (sliceHandleKey k) $ slices cache
     case slice of
-        Nothing -> ({-# SCC "tvarmodify" #-} liftIO $ atomically $ modifyTVar state f) >> getSelfPid >>= return . Right
+        Nothing -> liftM Right (({-# SCC "tvarmodify" #-} liftIO $ atomically $ modifyTVar state f) >> getSelfPid)
                         where f st0 = addPair st0 k val
-        Just sl -> (storeKey requester k val $ process sl) >>= return . Left
+        Just sl -> liftM Left (storeKey requester k val $ process sl)
 
 getKey' :: CacheState -> ProcessId -> Key -> Process (WaitingFor  (Maybe Value)) 
 getKey' state requester k = do
@@ -154,7 +153,7 @@ getKey' state requester k = do
             let slice = L.find (sliceHandleKey k) $ slices cache
             case slice of
                 Nothing -> return $ Right Nothing
-                Just sl -> (retrieveKey requester k $ process sl) >>= return . Left
+                Just sl -> liftM Left (retrieveKey requester k $ process sl)
 
 storeKey :: ProcessId -> Key -> Value -> ProcessId -> Process ()
 storeKey requester k val pid = send pid $ Set requester k val
@@ -169,13 +168,11 @@ pairsManager state = do
         msg <- expect
         case msg of
             -- if we don't have an immediate result, ignore, it has been forwarded
-            Get requester k -> do
-                getKey' state requester k >>= either ignore reply
+            Get requester k -> getKey' state requester k >>= either ignore reply
                 where reply    = send requester . RGet k
                       ignore _ = return ()
 
-            Set requester k val -> do
-                setKey' state requester k val >>= either ignore reply
+            Set requester k val -> setKey' state requester k val >>= either ignore reply
                 where reply    = send requester . RSet
                       ignore _ = return ()
 
@@ -195,10 +192,10 @@ monitoringManager state = do
         msg <- expect
         case msg of
             Ping from -> send from $ Pong me
-            Dump      -> liftIO $ (atomically $ readTVar state) >>= print
+            Dump      -> liftIO $ atomically (readTVar state) >>= print
 
 remoteSliceDied :: CacheState -> ProcessMonitorNotification -> Process ()
-remoteSliceDied state (ProcessMonitorNotification _ pid reason) = do
+remoteSliceDied state (ProcessMonitorNotification _ pid reason) = 
     liftIO $ atomically $ modifyTVar state f 
             where f st0 = removeAllSlicesForPid st0 pid
 
@@ -216,10 +213,10 @@ sliceMessage :: SliceUpdate -> Process ()
 sliceMessage = nsend "slice.server"
 
 remotable ['sliceMessage,'monitorMessage]
-remotables = __remoteTable $ initRemoteTable
+remotables = __remoteTable initRemoteTable
 
 forwardSliceUpdate :: SliceUpdate -> NodeId -> Process ()
-forwardSliceUpdate msg n = spawn n ($(mkClosure 'sliceMessage) (msg)) >> return ()
+forwardSliceUpdate msg n = void (spawn n ($(mkClosure 'sliceMessage) msg))
 
 runPort :: String -> [(Key,Key)] -> IO ()
 runPort port ks = do
@@ -232,11 +229,11 @@ runPort port ks = do
     mapM_ (\(kPair,n) -> forkIO (runBackend kPair n b)) (zip ks localNodes)
 
     -- channel to receive command to be parsed
-    tc <- atomically $ newTChan :: IO (TChan B.ByteString)
+    tc <- atomically newTChan :: IO (TChan B.ByteString)
 
     -- localnode doing the parsing is the node for the first slice
-    let me = localNodes !! 0
-    forkProcess me $ forever $ handleString =<< (liftIO $ atomically $ readTChan tc)
+    let me = head localNodes
+    forkProcess me $ forever $ handleString =<< liftIO (atomically $ readTChan tc)
 
      -- XXX this is an horrible hack to allow piping in stdin after some of time
     threadDelay 3000000 
@@ -262,14 +259,14 @@ handleString str = {-# SCC "handleString" #-} do
     this <- getSelfPid
     ret <- case ({-# SCC "splitOn" #-} C.split ' ' str) of
            ["dump"]     -> monitorMessage Dump     >>  return Nothing
-           ["get",k]    -> getKey this (read' k)   >>= return . Just . show
-           ["set",k,v]  -> setKey this (read' k) v >>= return . Just .show
+           ["get",k]    -> liftM (Just . show) (getKey this (read' k))
+           ["set",k,v]  -> liftM (Just . show) (setKey this (read' k) v)
            _            -> return $ Just "not understood"
     liftIO $ maybe (return ()) putStrLn ret
     where read' = fst . fromJust . C.readInt
 
 claimSliceToOtherNodes :: Slice -> Backend -> Process ()
-claimSliceToOtherNodes (Slice pid k0 k1) backend = do
+claimSliceToOtherNodes (Slice pid k0 k1) backend =
     forever $ {-# SCC "claimpeers" #-} do
         nodes <- liftIO $ findPeers backend 500000
         me <- getSelfNode
