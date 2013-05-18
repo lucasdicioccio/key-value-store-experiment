@@ -14,8 +14,8 @@ import Control.Distributed.Process.Backend.SimpleLocalnet
 import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Monad
--- import qualified Data.Map as M
-import qualified Data.IntMap as M
+import qualified Data.Map as M
+-- import qualified Data.IntMap as M
 import qualified Data.List as L
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
@@ -27,7 +27,7 @@ import Data.Maybe
 type Key    = Int
 type Value  = B.ByteString
 type ProcessName = ProcessId
-type KeyValueStore = M.IntMap Value
+type KeyValueStore = M.Map Key Value
 
 data Slice = Slice 
     { process   :: ProcessName
@@ -71,9 +71,12 @@ data PairReply = RGet Key (Maybe Value)
     | RSet ProcessId
     deriving (Show, Typeable)
 
+data Dumpable = DPeers | DKeys
+    deriving (Show, Eq, Typeable)
+
 data MonitorMessage = Ping ProcessId
     | Pong ProcessId
-    | Dump
+    | Dump Dumpable
     deriving (Show, Typeable)
 
 instance Binary PairRequest where
@@ -107,14 +110,24 @@ instance Binary SliceUpdate where
 instance Binary MonitorMessage where
     put (Ping pid)    = do putWord8 1; put pid
     put (Pong pid)    = do putWord8 2; put pid
-    put Dump          = putWord8 3
+    put (Dump what)   = do putWord8 3; put what
     get = do
         header <- getWord8
         case header of
           1 -> do (pid)     <- get; return (Ping pid)
           2 -> do (pid)     <- get; return (Pong pid)
-          3 -> return Dump
+          3 -> do (what)    <- get; return (Dump what)
           _ -> fail "MonitorMessage.get: invalid"
+
+
+instance Binary Dumpable where
+    put DKeys  = putWord8 0
+    put DPeers = putWord8 1
+    get = do
+        header <- getWord8
+        case header of
+          0 -> return DKeys
+          1 -> return DPeers
 
 setKey :: ProcessId -> Key -> Value -> Process ProcessId
 setKey me k v = do
@@ -191,8 +204,9 @@ monitoringManager state = do
     forever $ do
         msg <- expect
         case msg of
-            Ping from -> send from $ Pong me
-            Dump      -> liftIO $ atomically (readTVar state) >>= print
+            Ping from  -> send from $ Pong me
+            Dump DPeers -> liftIO $ atomically (readTVar state) >>= print . slices
+            Dump DKeys  -> liftIO $ atomically (readTVar state) >>= print . M.keys . pairs
 
 remoteSliceDied :: CacheState -> ProcessMonitorNotification -> Process ()
 remoteSliceDied state (ProcessMonitorNotification _ pid reason) = 
@@ -218,8 +232,8 @@ remotables = __remoteTable initRemoteTable
 forwardSliceUpdate :: SliceUpdate -> NodeId -> Process ()
 forwardSliceUpdate msg n = void (spawn n ($(mkClosure 'sliceMessage) msg))
 
-runPort :: String -> [(Key,Key)] -> IO ()
-runPort port ks = do
+runPort :: String -> [(Key,Key)] -> Int -> IO ()
+runPort port ks cs = do
     print ks 
     --backend
     b <- initializeBackend "localhost" port remotables 
@@ -235,14 +249,25 @@ runPort port ks = do
     let me = head localNodes
     forkProcess me $ forever $ handleString =<< liftIO (atomically $ readTChan tc)
 
-     -- XXX this is an horrible hack to allow piping in stdin after some of time
-    threadDelay 3000000 
+    threadDelay 3000000
     print "reading stdin"
-    E.catch (forever (B.getLine >>= \bs -> atomically (writeTChan tc bs))) ignore
+    E.catch (forever $ replicateM cs B.getLine >>= fillTChan' tc) ignore
+
+    atomically $ waitEmptyTChan tc
     print "done"
             where ignore :: IOException -> IO ()
                   ignore _ = return ()
 
+                  fillTChan tc = mapM_ (\bss -> fillTChan' tc bss)
+                  fillTChan' tc bss = do atomically $ mapM_ (writeTChan tc) bss
+                                         atomically $ waitEmptyTChan tc
+                                       
+
+waitEmptyTChan :: TChan a -> STM ()
+waitEmptyTChan tc = do  t <- isEmptyTChan tc
+                        if t
+                        then return ()
+                        else retry
 
 runBackend :: (Key,Key) -> LocalNode -> Backend -> IO ()
 runBackend (k0,k1) me backend = do
@@ -258,7 +283,8 @@ handleString :: B.ByteString -> Process ()
 handleString str = {-# SCC "handleString" #-} do 
     this <- getSelfPid
     ret <- case ({-# SCC "splitOn" #-} C.split ' ' str) of
-           ["dump"]     -> monitorMessage Dump     >>  return Nothing
+           ["peers"]    -> monitorMessage (Dump DPeers) >>  return Nothing
+           ["keys"]     -> monitorMessage (Dump DKeys)  >>  return Nothing
            ["get",k]    -> liftM (Just . show) (getKey this (read' k))
            ["set",k,v]  -> liftM (Just . show) (setKey this (read' k) v)
            _            -> return $ Just "not understood"
@@ -276,8 +302,7 @@ main :: IO ()
 main = do
     args <- getArgs
     case args of
-        port:[] -> runPort port [(0,65535)]
-        port:skps -> runPort port pairs
+        cs:port:skps -> runPort port pairs (read cs)
                     where pairs = map toKeyPair skps
                                     where toKeyPair :: String -> (Key,Key)
                                           toKeyPair s = head $ zip ks (tail ks)
